@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Trace black-and-white raster images into SVG, smoothly (potrace) or pixel-exact."""
+import argparse
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".psd"}
+
+
+def read_pbm(data):
+    """Parse a raw (P4) PBM into width, height and one '0'/'1' string per row."""
+    header = re.compile(rb"(?:\s|#[^\n]*\n)*(\S+)")
+    fields, pos = [], 0
+    while len(fields) < 3:
+        m = header.match(data, pos)
+        fields.append(m[1])
+        pos = m.end()
+    pos += 1  # single whitespace byte before the pixel data
+    w, h = int(fields[1]), int(fields[2])
+    stride = (w + 7) // 8
+    rows = []
+    for y in range(h):
+        bits = int.from_bytes(data[pos + y * stride:pos + (y + 1) * stride], "big")
+        rows.append(format(bits >> (stride * 8 - w), f"0{w}b"))
+    return w, h, rows
+
+
+def runs(row):
+    return ((m.start(), m.end()) for m in re.finditer("1+", row))
+
+
+def mask(a, b):
+    """Row string that is '1' where a is black and b is white."""
+    return format(int(a, 2) & ~int(b, 2) & ((1 << len(a)) - 1), f"0{len(a)}b")
+
+
+def outline(w, h, rows):
+    """Closed loops tracing the pixel boundaries of the black regions.
+
+    Edges run clockwise around black (black on the right in y-down
+    coordinates), so holes come out counter-clockwise.
+    """
+    edges, leaving = [], {}
+
+    def add(a, b):
+        leaving.setdefault(a, []).append(len(edges))
+        edges.append((a, b))
+
+    blank = "0" * w
+    for y in range(h + 1):
+        above = rows[y - 1] if y > 0 else blank
+        below = rows[y] if y < h else blank
+        for s, e in runs(mask(below, above)):  # top edge of black below
+            add((s, y), (e, y))
+        for s, e in runs(mask(above, below)):  # bottom edge of black above
+            add((e, y), (s, y))
+        if y < h:
+            for s, e in runs(below):
+                add((s, y + 1), (s, y))
+                add((e, y), (e, y + 1))
+
+    def successor(i):
+        a, b = edges[i]
+        outs = leaving[b]
+        if len(outs) == 1:
+            return outs[0]
+        # Diagonal touch: turn right so the black regions stay separate.
+        dx, dy = direction(a, b)
+        return next(j for j in outs if direction(*edges[j]) == (-dy, dx))
+
+    loops, seen = [], [False] * len(edges)
+    for first in range(len(edges)):
+        if seen[first]:
+            continue
+        loop, i = [], first
+        while not seen[i]:
+            seen[i] = True
+            loop.append(edges[i][0])
+            i = successor(i)
+        loops.append(corners(loop))
+    return loops
+
+
+def direction(a, b):
+    return ((b[0] > a[0]) - (b[0] < a[0]), (b[1] > a[1]) - (b[1] < a[1]))
+
+
+def corners(loop):
+    """Drop the points that sit mid-way along a straight edge."""
+    n = len(loop)
+    return [p for i, p in enumerate(loop)
+            if direction(loop[i - 1], p) != direction(p, loop[(i + 1) % n])]
+
+
+def area(loop):
+    return abs(sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1)
+                   in zip(loop, loop[1:] + loop[:1]))) // 2
+
+
+def exact_svg(bitmap, turdsize):
+    w, h, rows = read_pbm(bitmap)
+    d = []
+    for loop in outline(w, h, rows):
+        if area(loop) <= turdsize:
+            continue
+        (x, y), steps = loop[0], [f"M{loop[0][0]} {loop[0][1]}"]
+        for nx, ny in loop[1:]:
+            steps.append(f"h{nx - x}" if ny == y else f"v{ny - y}")
+            x, y = nx, ny
+        d.append("".join(steps) + "z")
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" '
+        f'width="{w}px" height="{h}px" viewBox="0 0 {w} {h}">\n'
+        f'<path fill="#000000" fill-rule="evenodd" d="{"".join(d)}"/>\n</svg>\n'
+    )
+
+
+def trace(src, dest, threshold=50, turdsize=None, smooth=1.0, invert=False,
+          exact=False):
+    bitmap = subprocess.run(
+        ["magick", str(src), "-background", "white", "-alpha", "remove",
+         "-colorspace", "gray", *(["-negate"] if invert else []),
+         "-threshold", f"{threshold}%", "pbm:-"],
+        check=True, capture_output=True,
+    ).stdout
+    if exact:
+        with open(dest, "w") as f:
+            f.write(exact_svg(bitmap, turdsize or 0))
+        return
+    if turdsize is None:
+        turdsize = 2
+    svg = subprocess.run(
+        ["potrace", "--svg", "--turdsize", str(turdsize),
+         "--alphamax", str(smooth), "--output", "-"],
+        input=bitmap, check=True, capture_output=True,
+    ).stdout.decode()
+    # potrace sizes the SVG in points; rewrite to the source's pixel size.
+    svg = re.sub(
+        r'width="([\d.]+)pt" height="([\d.]+)pt" viewBox="0 0 [\d.]+ [\d.]+"',
+        lambda m: 'width="{w}px" height="{h}px" viewBox="0 0 {w} {h}"'.format(
+            w=round(float(m[1])), h=round(float(m[2]))),
+        svg,
+    )
+    with open(dest, "w") as f:
+        f.write(svg)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input", type=Path, help="image file or folder of images")
+    parser.add_argument("-o", "--output", type=Path, required=True,
+                        help="SVG file, or folder when input is a folder")
+    parser.add_argument("--threshold", type=float, default=50,
+                        help="percent brightness below which a pixel is black (default 50)")
+    parser.add_argument("--turdsize", type=int,
+                        help="drop specks and holes of up to this many pixels "
+                             "(default 2, or 0 with --exact)")
+    parser.add_argument("--smooth", type=float, default=1.0,
+                        help="corner rounding, 0 = sharp polygons, 1.334 = all curves (default 1.0)")
+    parser.add_argument("--invert", action="store_true",
+                        help="trace white art on a black background")
+    parser.add_argument("--exact", action="store_true",
+                        help="follow pixel edges exactly instead of fitting curves")
+    args = parser.parse_args(argv)
+    options = dict(threshold=args.threshold, turdsize=args.turdsize,
+                   smooth=args.smooth, invert=args.invert, exact=args.exact)
+
+    if args.input.is_dir():
+        args.output.mkdir(parents=True, exist_ok=True)
+        jobs = [(src, args.output / (src.stem + ".svg"))
+                for src in sorted(args.input.iterdir())
+                if src.suffix.lower() in IMAGE_SUFFIXES]
+    else:
+        jobs = [(args.input, args.output)]
+
+    for src, dest in jobs:
+        try:
+            trace(src, dest, **options)
+        except subprocess.CalledProcessError as e:
+            sys.exit(f"r2v: {src}: {e.stderr.decode().strip()}")
+        print(f"{src} -> {dest}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
