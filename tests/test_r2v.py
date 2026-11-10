@@ -174,6 +174,56 @@ class ExactTest(unittest.TestCase):
         self.assertEqual(dropped.read_text().count("M"), 1)
 
 
+@unittest.skipUnless(CHROME, "needs Chrome to render SVG faithfully")
+class CheckTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def test_check_reports_zero_differing_pixels_for_exact_dither(self):
+        src = self.tmp / "dither.png"
+        magick("-size", "32x32", "xc:white", "(", "-size", "8x8", "pattern:gray50",
+               ")", "-geometry", "+12+12", "-composite", str(src))
+        out = self.tmp / "dither.svg"
+
+        result = run_r2v(src, "-o", out, "--exact", "--check")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"check: {out}: 0 of 1024 pixels differ (0.00%), rendered with Chrome",
+                      result.stdout)
+
+    def test_check_compares_inverted_trace_against_inverted_source(self):
+        src = self.tmp / "negative.png"
+        magick("-size", "32x32", "xc:black", "(", "-size", "8x8", "pattern:gray50",
+               "-negate", ")", "-geometry", "+12+12", "-composite", str(src))
+        out = self.tmp / "negative.svg"
+
+        result = run_r2v(src, "-o", out, "--exact", "--invert", "--check")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"check: {out}: 0 of 1024 pixels differ", result.stdout)
+
+
+class CheckFallbackTest(unittest.TestCase):
+    def test_check_falls_back_to_imagemagick_without_chrome(self):
+        tmp = Path(tempfile.mkdtemp())
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        for tool in ("magick", "potrace"):
+            (bin_dir / tool).symlink_to(shutil.which(tool))
+        src, out = tmp / "box.png", tmp / "box.svg"
+        magick("-size", "40x30", "xc:white", "-fill", "black",
+               "-draw", "rectangle 10,10 29,19", str(src))
+
+        result = subprocess.run(
+            [sys.executable, str(R2V), str(src), "-o", str(out), "--exact", "--check"],
+            capture_output=True, text=True, env={"PATH": str(bin_dir)})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout,
+                         rf"check: {re.escape(str(out))}: \d+ of 1200 pixels differ "
+                         r"\(\d+\.\d\d%\), rendered with ImageMagick")
+
+
 class FolderTest(unittest.TestCase):
     def test_traces_every_image_in_folder_and_skips_other_files(self):
         tmp = Path(tempfile.mkdtemp())

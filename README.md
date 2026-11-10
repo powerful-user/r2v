@@ -28,9 +28,24 @@ dimensions.
 | `--smooth N` | 1.0 | Corner rounding: 0 gives sharp polygons, 1.334 all curves. Ignored with `--exact`. |
 | `--invert` | off | Trace white art on a black background. |
 | `--exact` | off | Follow pixel edges exactly instead of fitting curves. |
+| `--check` | off | Render each SVG back (headless Chrome, else ImageMagick) and print how many pixels differ from the 1-bit source. |
 
 Layered PSDs and multi-page files trace only the first image (the flattened
 composite for a PSD).
+
+## Agent skill
+
+The repository ships an [Agent Skill](https://skills.sh) in `skills/r2v/`
+that teaches coding agents (Claude Code, Codex, Cursor and others) when to
+reach for `r2v`, which mode to pick, and how to check the result. The
+script itself lives in `skills/r2v/scripts/r2v`, so the skill carries it;
+`./r2v` at the root is a symlink to it. Install it with:
+
+```bash
+npx skills add powerful-user/r2v
+```
+
+The agent still needs ImageMagick 7, potrace and Python 3 on the machine.
 
 ## Tests
 
@@ -38,5 +53,7 @@ composite for a PSD).
 python3 -m unittest discover -s tests
 ```
 
-The `--exact` round-trip tests render with headless Chrome (ImageMagick's
-built-in SVG renderer is not faithful) and skip when Chrome is missing.
+The `--exact` round-trip and `--check` tests render with headless Chrome
+(ImageMagick's built-in SVG renderer is not faithful) and skip when Chrome
+is missing. `tests/scenarios.md` holds the pressure scenarios for the agent
+skill.
